@@ -242,7 +242,7 @@ git push origin feature/your-contribution
 @software{oneiros2025,
   author = {Rajat Malik},
   title = {Oneiros: Continuous Latent Reasoning with Autonomous Dream Consolidation},
-  year = {2025},
+  year = {2026},
   url = {https://github.com/Rajat25022005/oneiros}
 }
 ```
