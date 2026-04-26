@@ -111,8 +111,7 @@ def train_stage2(config_path: str, stage1_checkpoint: str = None):
         else "cpu"
     )
     n_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
-    use_multi_gpu = train_cfg.get("multi_gpu", False) and n_gpus > 1
-    print(f"[Stage2] Device: {device} | GPUs: {n_gpus} | DataParallel: {use_multi_gpu}")
+    print(f"[Stage2] Device: {device} | GPUs available: {n_gpus}")
 
     # ── build models ──────────────────────────────────────────────────
 
@@ -160,14 +159,6 @@ def train_stage2(config_path: str, stage1_checkpoint: str = None):
 
     backbone.eval()
     thought_block.eval()
-
-    # ── multi-GPU ─────────────────────────────────────────────────────
-
-    if use_multi_gpu:
-        backbone = nn.DataParallel(backbone)
-        thought_block = nn.DataParallel(thought_block)
-        decoder = nn.DataParallel(decoder)
-        print(f"[Stage2] DataParallel enabled across {n_gpus} GPUs")
 
     trainable_params = sum(p.numel() for p in decoder.parameters())
     print(f"[Stage2] Decoder trainable params: {trainable_params:,}")
