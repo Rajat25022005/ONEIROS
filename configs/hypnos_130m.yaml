@@ -1,50 +1,39 @@
 # ─────────────────────────────────────────────────────────────
-# Hypnos-130M configuration
+# Hypnos-130M Configuration
 # ─────────────────────────────────────────────────────────────
 
 model:
-  d_model: 768
-  n_layers: 24
-  vocab_size: 50280
-
-thought:
-  d_model: 768
-  k_steps: 4
-  share_weights: true
-  expansion: 4
-  dropout: 0.1
-
-ema:
-  decay: 0.999
-
-decoder:
-  d_model: 768
-  vocab_size: 50280
-  tie_weights: true
+  backbone: "state-spaces/mamba-130m-hf"
+  latent_dim: 256
+  k_steps: 8
+  ema_tau: 0.999
+  vocab_size: 50257
+  decoder_hidden: 512
+  max_length: 128
 
 state:
-  d_model: 768
-  max_history: 64
+  dir: ".hypnos/state"
 
 gate:
-  d_model: 768
-  dream_threshold: 0.3
-  awake_threshold: 0.7
+  idle_threshold: 30.0
+  verbose: true
 
 dream:
-  max_dream_steps: 32
-  coherence_floor: 0.4
-  noise_scale: 0.01
-  thought_steps_per_dream: 2
+  k_steps: 4
+  coherence_threshold: 0.3
+  consolidation_rate: 0.1
+  stability_lambda: 0.01
+  max_cycles_per_session: 500
+  verbose: true
 
 training:
-  stage1:
-    epochs: 50
-    lr: 3.0e-4
-    weight_decay: 0.01
-    batch_size: 32
-    warmup_steps: 1000
-    max_seq_len: 512
-    gradient_clip: 1.0
-    jepa_loss_weight: 1.0
-    coherence_loss_weight: 0.5
+  batch_size: 8
+  learning_rate: 1.0e-4
+  weight_decay: 0.01
+  warmup_steps: 500
+  max_steps: 10000
+  grad_clip: 1.0
+  max_seq_len: 512
+  checkpoint_every: 1000
+  dataset: "roneneldan/TinyStories"
+  log_every: 50
