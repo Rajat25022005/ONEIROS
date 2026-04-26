@@ -1,0 +1,50 @@
+# ─────────────────────────────────────────────────────────────
+# Hypnos-130M configuration
+# ─────────────────────────────────────────────────────────────
+
+model:
+  d_model: 768
+  n_layers: 24
+  vocab_size: 50280
+
+thought:
+  d_model: 768
+  k_steps: 4
+  share_weights: true
+  expansion: 4
+  dropout: 0.1
+
+ema:
+  decay: 0.999
+
+decoder:
+  d_model: 768
+  vocab_size: 50280
+  tie_weights: true
+
+state:
+  d_model: 768
+  max_history: 64
+
+gate:
+  d_model: 768
+  dream_threshold: 0.3
+  awake_threshold: 0.7
+
+dream:
+  max_dream_steps: 32
+  coherence_floor: 0.4
+  noise_scale: 0.01
+  thought_steps_per_dream: 2
+
+training:
+  stage1:
+    epochs: 50
+    lr: 3.0e-4
+    weight_decay: 0.01
+    batch_size: 32
+    warmup_steps: 1000
+    max_seq_len: 512
+    gradient_clip: 1.0
+    jepa_loss_weight: 1.0
+    coherence_loss_weight: 0.5

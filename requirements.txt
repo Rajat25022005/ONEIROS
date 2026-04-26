@@ -1,0 +1,21 @@
+# Core — pinned to versions compatible with PyTorch/XLA 2.4
+torch==2.4.0
+torch_xla[tpu]==2.4.0        # ← NEW: PyTorch/XLA for TPU support
+
+transformers==4.38.0
+sentence-transformers==2.5.0
+datasets==2.18.0
+pyyaml==6.0.1
+numpy==1.26.4
+scikit-learn==1.4.1.post1
+matplotlib==3.8.3
+seaborn==0.13.2
+tqdm==4.66.2
+wandb==0.16.4
+einops==0.7.0
+evaluate==0.4.1
+bert-score==0.3.13
+accelerate==0.27.0           # bitsandbytes removed — not needed on TPU
+rouge_score
+nltk
+absl-py
