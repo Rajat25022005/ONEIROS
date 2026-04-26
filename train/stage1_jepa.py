@@ -128,7 +128,9 @@ def train_stage1(config_path: str):
         else "cuda" if torch.cuda.is_available()
         else "cpu"
     )
-    print(f"[Stage1] Device: {device}")
+    n_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    use_multi_gpu = train_cfg.get("multi_gpu", False) and n_gpus > 1
+    print(f"[Stage1] Device: {device} | GPUs: {n_gpus} | DataParallel: {use_multi_gpu}")
 
     # build models
     backbone = MambaBackbone(
@@ -150,6 +152,12 @@ def train_stage1(config_path: str):
     # freeze backbone — only train reasoning
     for param in backbone.parameters():
         param.requires_grad_(False)
+
+    # wrap with DataParallel for multi-GPU
+    if use_multi_gpu:
+        backbone = nn.DataParallel(backbone)
+        thought_block = nn.DataParallel(thought_block)
+        print(f"[Stage1] DataParallel enabled across {n_gpus} GPUs")
 
     # optimizer + scheduler
     optimizer = AdamW(

@@ -1,14 +1,17 @@
 # ─────────────────────────────────────────────────────────────
-# Hypnos-130M Configuration — Dual T4 (2x 16GB VRAM)
+# Hypnos-1.4B Configuration — Dual T4 (2x 16GB VRAM)
+#
+# Mamba-1.4B: hidden_size=2048, 48 layers, ~5.4GB in bf16
+# Fits comfortably on 2x T4 with DataParallel
 # ─────────────────────────────────────────────────────────────
 
 model:
-  backbone: "state-spaces/mamba-130m-hf"
-  latent_dim: 256
+  backbone: "state-spaces/mamba-1.4b-hf"
+  latent_dim: 512              # scaled up: 1.4B has 2048 hidden, so 512 latent
   k_steps: 8
   ema_tau: 0.999
-  vocab_size: 50257
-  decoder_hidden: 512
+  vocab_size: 50280            # Mamba-1.4B uses 50280 vocab
+  decoder_hidden: 1024         # scaled up for bigger latent space
   max_length: 128
 
 state:
@@ -27,14 +30,14 @@ dream:
   verbose: true
 
 training:
-  batch_size: 32             # 4x larger — dual T4 can handle it
-  learning_rate: 3.0e-4      # scale LR with batch size (linear scaling)
+  batch_size: 16               # 1.4B uses more VRAM per sample
+  learning_rate: 1.0e-4
   weight_decay: 0.01
-  warmup_steps: 200
-  max_steps: 5000            # fewer steps needed with larger batches
+  warmup_steps: 300
+  max_steps: 5000
   grad_clip: 1.0
   max_seq_len: 512
   checkpoint_every: 500
   dataset: "roneneldan/TinyStories"
   log_every: 50
-  multi_gpu: true            # enable DataParallel across both T4s
+  multi_gpu: true
