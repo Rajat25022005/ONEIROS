@@ -201,12 +201,21 @@ def train_stage1_tpu(config_path: str):
     from hypnos.model.thought_block import ThoughtBlock
     from hypnos.model.ema_teacher import EMATeacher
 
+    # Backbone stays on CPU — Mamba's sequential scan doesn't compile
+    # on XLA (hangs). Since backbone is frozen, CPU is fine. We only
+    # transfer the small hidden states (B, 2048) to TPU.
+    cpu_device = torch.device("cpu")
     backbone = MambaBackbone(
         model_cfg.get("backbone", "state-spaces/mamba-1.4b-hf"),
         use_slow_path=model_cfg.get("use_slow_path", True),
     )
-    backbone.to(device)
+    backbone.to(cpu_device)
+    for param in backbone.parameters():
+        param.requires_grad_(False)
+    backbone.eval()
+    print("[Stage1-TPU] Backbone on CPU (frozen, avoids XLA compilation)")
 
+    # Trainable components on TPU
     thought_block = ThoughtBlock(
         input_dim=backbone.hidden_size,
         latent_dim=model_cfg.get("latent_dim", 512),
@@ -218,10 +227,7 @@ def train_stage1_tpu(config_path: str):
         tau=model_cfg.get("ema_tau", 0.999),
     ).to(device)
 
-    # freeze backbone — only train reasoning
-    for param in backbone.parameters():
-        param.requires_grad_(False)
-    backbone.eval()
+    print("[Stage1-TPU] ThoughtBlock + EMATeacher on TPU")
 
     # ── data pipeline ─────────────────────────────────────────────────
     # Global batch size — SPMD shards this across chips automatically
@@ -265,40 +271,38 @@ def train_stage1_tpu(config_path: str):
         f"Global batch: {global_batch_size} | "
         f"SPMD across {num_devices} chips"
     )
+    sys.stdout.flush()
 
     for epoch in range(100):  # max epochs (will break by max_steps)
         for context_ids, target_ids in dataloader:
             if global_step >= train_cfg["max_steps"]:
                 break
 
-            # Move to XLA device
-            context_ids = context_ids.to(device)
-            target_ids = target_ids.to(device)
+            # ── backbone encode on CPU (avoids XLA compilation) ───────
+            with torch.no_grad():
+                hidden_ctx, _ = backbone.encode(context_ids)
+                hidden_tgt, _ = backbone.encode(target_ids)
 
-            # Shard batch across TPU chips (data parallelism)
-            xs.mark_sharding(context_ids, mesh, ("data", None))
-            xs.mark_sharding(target_ids, mesh, ("data", None))
+            # ── transfer hidden states to TPU ─────────────────────────
+            hidden_ctx = hidden_ctx.to(device)
+            hidden_tgt = hidden_tgt.to(device)
+
+            # Shard across TPU chips
+            xs.mark_sharding(hidden_ctx, mesh, ("data", None))
+            xs.mark_sharding(hidden_tgt, mesh, ("data", None))
 
             optimizer.zero_grad()
 
-            # student path — mark_step after backbone to break XLA graph
-            # (Mamba sequential scan creates huge graphs that hang compilation)
-            with torch.no_grad():
-                hidden_ctx, _ = backbone.encode(context_ids)
-            xm.mark_step()  # compile backbone separately
+            # student path (on TPU)
             z_student, _ = thought_block(hidden_ctx)
 
-            # teacher path (no grad)
-            with torch.no_grad():
-                hidden_tgt, _ = backbone.encode(target_ids)
-            xm.mark_step()  # compile backbone separately
+            # teacher path (on TPU, no grad)
             with torch.no_grad():
                 z_teacher, _ = ema_teacher(hidden_tgt)
 
-            # loss
+            # loss + backward (on TPU)
             loss = jepa_loss(z_student, z_teacher)
             loss.backward()
-            xm.mark_step()  # compile backward separately
 
             # gradient clipping
             torch.nn.utils.clip_grad_norm_(
