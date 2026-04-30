@@ -28,8 +28,12 @@ print(f" XLA_USE_BF16: {os.environ.get('XLA_USE_BF16')}")
 print("==============================================")
 print()
 
+import importlib
+
 # ── Stage 1: JEPA pre-training ────────────────────────────────────────
 print("[Pipeline] Starting Stage 1: JEPA training...")
+import train.stage1_jepa_tpu as _s1
+importlib.reload(_s1)
 from train.stage1_jepa_tpu import train_stage1_tpu
 
 train_stage1_tpu("configs/hypnos_1.4b_tpu.yaml")
@@ -38,6 +42,8 @@ print()
 
 # ── Stage 2: Decoder training ─────────────────────────────────────────
 print("[Pipeline] Starting Stage 2: Decoder training...")
+import train.stage2_decoder_tpu as _s2
+importlib.reload(_s2)
 from train.stage2_decoder_tpu import train_stage2_tpu
 
 train_stage2_tpu("configs/hypnos_1.4b_tpu.yaml")
