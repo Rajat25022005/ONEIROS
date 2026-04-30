@@ -275,8 +275,11 @@ def train_stage2_tpu(
             optimizer.zero_grad()
 
             # encode context through frozen backbone + thought block
+            # mark_step after backbone to break XLA graph
             with torch.no_grad():
                 hidden, _ = backbone.encode(context_ids)
+            xm.mark_step()  # compile backbone separately
+            with torch.no_grad():
                 z_final, _ = thought_block(hidden)
 
             # decoder: predict target tokens from z_final
@@ -294,6 +297,7 @@ def train_stage2_tpu(
             )
 
             loss.backward()
+            xm.mark_step()  # compile backward separately
 
             torch.nn.utils.clip_grad_norm_(
                 decoder.parameters(),

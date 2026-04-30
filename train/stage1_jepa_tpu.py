@@ -281,19 +281,24 @@ def train_stage1_tpu(config_path: str):
 
             optimizer.zero_grad()
 
-            # student path
+            # student path — mark_step after backbone to break XLA graph
+            # (Mamba sequential scan creates huge graphs that hang compilation)
             with torch.no_grad():
                 hidden_ctx, _ = backbone.encode(context_ids)
+            xm.mark_step()  # compile backbone separately
             z_student, _ = thought_block(hidden_ctx)
 
             # teacher path (no grad)
             with torch.no_grad():
                 hidden_tgt, _ = backbone.encode(target_ids)
+            xm.mark_step()  # compile backbone separately
+            with torch.no_grad():
                 z_teacher, _ = ema_teacher(hidden_tgt)
 
             # loss
             loss = jepa_loss(z_student, z_teacher)
             loss.backward()
+            xm.mark_step()  # compile backward separately
 
             # gradient clipping
             torch.nn.utils.clip_grad_norm_(

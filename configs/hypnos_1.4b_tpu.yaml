@@ -30,7 +30,7 @@ training:
   warmup_steps: 300
   max_steps: 5000
   grad_clip: 1.0
-  max_seq_len: 512          
+  max_seq_len: 256          
   checkpoint_every: 500
   dataset: "HuggingFaceFW/fineweb-edu"
   dataset_config: "sample-10BT"    
