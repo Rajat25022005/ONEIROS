@@ -38,6 +38,6 @@ training:
   grad_clip: 1.0
   max_seq_len: 512
   checkpoint_every: 500
-  dataset: "roneneldan/TinyStories"
+  dataset: "HuggingFaceFW/fineweb-edu"
   log_every: 50
   multi_gpu: true

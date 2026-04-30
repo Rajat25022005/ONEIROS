@@ -10,33 +10,45 @@ if [ "$WANDB" = "true" ]; then
   WANDB_FLAG="--wandb"
 fi
 
-# ── TPU environment ─────────────────────────────────────────────────────────
-export PJRT_DEVICE=TPU          # tells PyTorch/XLA to use TPU backend
-export XLA_USE_BF16=1           # use BF16 everywhere on TPU (free speedup)
-export XLA_TENSOR_ALLOCATOR_MAXSIZE=100000000   # avoids OOM on large batches
+# ── Detect runtime: TPU or GPU ───────────────────────────────────────
+if [ "${PJRT_DEVICE:-}" = "TPU" ]; then
+  # ── TPU training path ─────────────────────────────────────────────
+  export XLA_USE_BF16=1
+  export XLA_TENSOR_ALLOCATOR_MAXSIZE=100000000
 
-echo "=============================================="
-echo " Think-in-Silence — TPU Training Pipeline"
-echo " Config  : $CONFIG"
-echo " Seed    : $SEED"
-echo " Device  : $PJRT_DEVICE"
-echo "=============================================="
-echo ""
+  echo "=============================================="
+  echo " Hypnos — TPU Training Pipeline"
+  echo " Config  : $CONFIG"
+  echo " Device  : TPU (PJRT)"
+  echo "=============================================="
+  echo ""
 
-echo "[Stage 1] JEPA training..."
-python main.py --config "$CONFIG" --seed "$SEED" $WANDB_FLAG
+  echo "[Stage 1] JEPA training (TPU)..."
+  python -m train.stage1_jepa_tpu --config "$CONFIG"
 
-echo ""
-echo "[Stage 2] Decoder training..."
-python train_decoder.py --config "$CONFIG" --seed "$SEED" $WANDB_FLAG
+  echo ""
+  echo "[Stage 2] Decoder training (TPU)..."
+  python -m train.stage2_decoder_tpu --config "$CONFIG"
 
-echo ""
-echo "[Stage 3] Joint fine-tuning..."
-python finetune.py --config "$CONFIG" --seed "$SEED" $WANDB_FLAG
+  echo ""
+  echo "Done. Checkpoints saved to checkpoints/"
 
-echo ""
-echo "[Eval] Running full evaluation..."
-python eval.py --config "$CONFIG" --eval_type all
+else
+  # ── GPU / CPU training path (original) ─────────────────────────────
+  echo "=============================================="
+  echo " Hypnos — GPU/CPU Training Pipeline"
+  echo " Config  : $CONFIG"
+  echo " Seed    : $SEED"
+  echo "=============================================="
+  echo ""
 
-echo ""
-echo "Done. Results saved to results/"
+  echo "[Stage 1] JEPA training..."
+  python -m train.stage1_jepa --config "$CONFIG"
+
+  echo ""
+  echo "[Stage 2] Decoder training..."
+  python -m train.stage2_decoder --config "$CONFIG"
+
+  echo ""
+  echo "Done. Checkpoints saved to checkpoints/"
+fi

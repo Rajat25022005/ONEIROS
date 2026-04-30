@@ -20,9 +20,14 @@ class MambaBackbone(nn.Module):
     sessions.  This is what makes Hypnos's persistent memory possible.
     """
 
-    def __init__(self, model_name: str = "state-spaces/mamba-130m-hf"):
+    def __init__(
+        self,
+        model_name: str = "state-spaces/mamba-130m-hf",
+        use_slow_path: bool = False,
+    ):
         super().__init__()
         self.model_name = model_name
+        self.use_slow_path = use_slow_path
         self._load_model()
 
     # ── model loading ─────────────────────────────────────────────────
@@ -33,8 +38,13 @@ class MambaBackbone(nn.Module):
             from transformers import MambaModel, MambaConfig, AutoTokenizer
 
             self.config = MambaConfig.from_pretrained(self.model_name)
+
+            if self.use_slow_path:
+                self.config.use_cuda = False
+
             self.model = MambaModel.from_pretrained(
                 self.model_name,
+                config=self.config,
                 torch_dtype=torch.bfloat16,
             )
             self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)

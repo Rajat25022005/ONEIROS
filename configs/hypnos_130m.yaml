@@ -1,6 +1,3 @@
-# ─────────────────────────────────────────────────────────────
-# Hypnos-130M Configuration — Dual T4 (2x 16GB VRAM)
-# ─────────────────────────────────────────────────────────────
 
 model:
   backbone: "state-spaces/mamba-130m-hf"
@@ -27,14 +24,13 @@ dream:
   verbose: true
 
 training:
-  batch_size: 32             # 4x larger — dual T4 can handle it
-  learning_rate: 3.0e-4      # scale LR with batch size (linear scaling)
+  batch_size: 8
+  learning_rate: 1.0e-4
   weight_decay: 0.01
-  warmup_steps: 200
-  max_steps: 5000            # fewer steps needed with larger batches
+  warmup_steps: 500
+  max_steps: 10000
   grad_clip: 1.0
   max_seq_len: 512
-  checkpoint_every: 500
+  checkpoint_every: 1000
   dataset: "roneneldan/TinyStories"
   log_every: 50
-  multi_gpu: true            # enable DataParallel across both T4s

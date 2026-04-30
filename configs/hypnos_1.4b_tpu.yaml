@@ -1,0 +1,42 @@
+model:
+  backbone: "state-spaces/mamba-1.4b-hf"
+  latent_dim: 512       
+  k_steps: 8
+  ema_tau: 0.999
+  vocab_size: 50280          
+  decoder_hidden: 1024         
+  max_length: 128
+  use_slow_path: true        
+
+state:
+  dir: ".hypnos/state"
+
+gate:
+  idle_threshold: 30.0
+  verbose: true
+
+dream:
+  k_steps: 4
+  coherence_threshold: 0.3
+  consolidation_rate: 0.1
+  stability_lambda: 0.01
+  max_cycles_per_session: 500
+  verbose: true
+
+training:
+  batch_size: 2            
+  learning_rate: 1.0e-4
+  weight_decay: 0.01
+  warmup_steps: 300
+  max_steps: 5000
+  grad_clip: 1.0
+  max_seq_len: 512          
+  checkpoint_every: 500
+  dataset: "HuggingFaceFW/fineweb-edu"
+  dataset_config: "sample-10BT"    
+  dataset_split: "train[:100000]"  
+  log_every: 50
+
+  tpu: true
+  num_cores: 8
+  bf16: true
