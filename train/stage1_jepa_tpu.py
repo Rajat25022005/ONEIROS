@@ -1,11 +1,14 @@
 """
 train/stage1_jepa_tpu.py — Stage 1: JEPA pre-training on TPU v5e-8
 
-Single-process SPMD training of the ThoughtBlock to predict future
-latent states, supervised by the EMA teacher's coherence signal.
-Uses PyTorch/XLA SPMD to shard data across all 8 TPU chips automatically.
+Two-phase training:
+  Phase 1 (CPU): Pre-compute all backbone hidden states and cache them.
+                 Mamba's sequential scan can't compile on XLA, so we run
+                 it once on CPU and save the outputs.
+  Phase 2 (TPU): Train ThoughtBlock on cached embeddings at full TPU speed.
+                 Only the small ThoughtBlock + EMATeacher run on TPU.
 
-Backbone is frozen — we only train reasoning, not world knowledge.
+This avoids the 18s/step bottleneck from running Mamba on CPU every step.
 
 Usage (Kaggle notebook):
     from train.stage1_jepa_tpu import train_stage1_tpu
@@ -26,7 +29,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, TensorDataset
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -95,80 +98,119 @@ def jepa_loss(
     return total
 
 
-# ── Fixed-shape dataset for XLA ──────────────────────────────────────
+# ── Phase 1: Pre-cache backbone embeddings ───────────────────────────
 
-class FixedLengthTextDataset(Dataset):
+def precache_backbone_embeddings(backbone, tokenizer, config):
     """
-    Pre-tokenized dataset with fixed sequence length.
+    Run Mamba backbone once on CPU for all examples.
+    Returns cached (hidden_ctx, hidden_tgt) tensors.
 
-    All sequences are padded/truncated to max_seq_len to avoid XLA
-    graph recompilation from shape changes.
+    This is the key optimization: instead of running the 1.4B backbone
+    every training step (18s/step on CPU), we run it once upfront (~30 min)
+    and then train ThoughtBlock purely on TPU (~0.1s/step).
     """
+    from datasets import load_dataset
 
-    def __init__(self, tokenizer, config):
-        from datasets import load_dataset
+    train_cfg = config["training"]
+    max_seq_len = train_cfg["max_seq_len"]
 
-        train_cfg = config["training"]
-        self.max_seq_len = train_cfg["max_seq_len"]
+    print("[Stage1-TPU] ═══ Phase 1: Pre-caching backbone embeddings on CPU ═══")
+    print("[Stage1-TPU] Loading and tokenizing dataset...")
+    sys.stdout.flush()
 
-        print("[Stage1-TPU] Loading and tokenizing dataset...")
+    dataset_name = train_cfg.get("dataset", "HuggingFaceFW/fineweb-edu")
+    dataset_config = train_cfg.get("dataset_config", None)
+    dataset_split = train_cfg.get("dataset_split", "train")
 
-        dataset_name = train_cfg.get("dataset", "HuggingFaceFW/fineweb-edu")
-        dataset_config = train_cfg.get("dataset_config", None)
-        dataset_split = train_cfg.get("dataset_split", "train")
+    ds = load_dataset(
+        dataset_name,
+        name=dataset_config,
+        split=dataset_split,
+    )
 
-        ds = load_dataset(
-            dataset_name,
-            name=dataset_config,
-            split=dataset_split,
+    # Pre-tokenize
+    def tokenize_fn(examples):
+        tokens = tokenizer(
+            examples["text"],
+            truncation=True,
+            padding="max_length",
+            max_length=max_seq_len,
+            return_tensors=None,
         )
+        return {"input_ids": tokens["input_ids"]}
 
-        # Pre-tokenize all examples to fixed length
-        def tokenize_fn(examples):
-            tokens = tokenizer(
-                examples["text"],
-                truncation=True,
-                padding="max_length",
-                max_length=self.max_seq_len,
-                return_tensors=None,
+    ds = ds.map(
+        tokenize_fn,
+        batched=True,
+        batch_size=1000,
+        remove_columns=ds.column_names,
+        desc="Tokenizing",
+    )
+    ds.set_format("torch")
+
+    all_ids = ds["input_ids"]
+    mid = max_seq_len // 2
+    n_examples = len(all_ids)
+
+    print(f"[Stage1-TPU] Dataset: {n_examples} examples, seq_len={max_seq_len}")
+    print(f"[Stage1-TPU] Running Mamba-1.4B on CPU for all examples...")
+    print(f"[Stage1-TPU] This takes ~20-30 min but only happens once.")
+    sys.stdout.flush()
+
+    # Process in batches on CPU
+    cache_batch_size = 8  # CPU batch size for backbone
+    all_hidden_ctx = []
+    all_hidden_tgt = []
+
+    start = time.time()
+    backbone.eval()
+
+    for i in range(0, n_examples, cache_batch_size):
+        batch_ids = all_ids[i : i + cache_batch_size]
+
+        context_ids = batch_ids[:, :mid]
+        target_ids = batch_ids[:, mid:]
+
+        with torch.no_grad():
+            h_ctx, _ = backbone.encode(context_ids)
+            h_tgt, _ = backbone.encode(target_ids)
+
+        # Mean-pool over sequence length to get fixed-size embeddings
+        # Shape: (batch, hidden_size)
+        all_hidden_ctx.append(h_ctx.mean(dim=1).cpu())
+        all_hidden_tgt.append(h_tgt.mean(dim=1).cpu())
+
+        done = min(i + cache_batch_size, n_examples)
+        if done % 500 == 0 or done == n_examples:
+            elapsed = time.time() - start
+            rate = done / elapsed if elapsed > 0 else 0
+            eta = (n_examples - done) / rate if rate > 0 else 0
+            print(
+                f"[Stage1-TPU]   Cached {done:>6d}/{n_examples} "
+                f"({100*done/n_examples:.1f}%) | "
+                f"{rate:.1f} ex/s | ETA: {eta:.0f}s"
             )
-            return {"input_ids": tokens["input_ids"]}
+            sys.stdout.flush()
 
-        ds = ds.map(
-            tokenize_fn,
-            batched=True,
-            batch_size=1000,
-            remove_columns=ds.column_names,
-            desc="Tokenizing",
-        )
-        ds.set_format("torch")
+    hidden_ctx = torch.cat(all_hidden_ctx, dim=0)
+    hidden_tgt = torch.cat(all_hidden_tgt, dim=0)
 
-        self.input_ids = ds["input_ids"]
-        print(
-            f"[Stage1-TPU] Dataset ready: {len(self.input_ids)} examples, "
-            f"fixed length {self.max_seq_len}"
-        )
+    elapsed = time.time() - start
+    print(f"[Stage1-TPU] ═══ Phase 1 complete: {elapsed:.0f}s ═══")
+    print(f"[Stage1-TPU] Cached shapes: ctx={hidden_ctx.shape}, tgt={hidden_tgt.shape}")
+    sys.stdout.flush()
 
-    def __len__(self):
-        return len(self.input_ids)
-
-    def __getitem__(self, idx):
-        ids = self.input_ids[idx]
-        mid = self.max_seq_len // 2
-        context = ids[:mid]
-        target = ids[mid:]
-        return context, target
+    return hidden_ctx, hidden_tgt
 
 
-# ── Training ─────────────────────────────────────────────────────────
+# ── Phase 2: Train ThoughtBlock on TPU ────────────────────────────────
 
 def train_stage1_tpu(config_path: str):
     """
     Stage 1 JEPA training using SPMD on TPU v5e-8.
 
-    SPMD (Single Program Multiple Data) runs as a single process.
-    The XLA compiler automatically shards data across all 8 TPU chips
-    based on sharding annotations — no xmp.spawn needed.
+    Phase 1: Pre-cache backbone embeddings on CPU (~30 min, once)
+    Phase 2: Train ThoughtBlock on TPU at full speed (~0.1s/step)
     """
     import torch_xla
     import torch_xla.core.xla_model as xm
@@ -176,48 +218,59 @@ def train_stage1_tpu(config_path: str):
     import torch_xla.distributed.spmd as xs
     from torch_xla.distributed.spmd import Mesh
 
-    # Enable SPMD mode — must be called before any XLA tensor creation
-    xr.use_spmd()
-
-    device = xm.xla_device()
-    num_devices = xr.global_runtime_device_count()
-    print(f"[Stage1-TPU] Device: {device} | TPU chips: {num_devices}")
-
-    # Create 1D mesh for data parallelism across all chips
-    mesh = Mesh(
-        np.arange(num_devices),
-        (num_devices,),
-        ("data",),
-    )
-
     with open(config_path) as f:
         config = yaml.safe_load(f)
 
     train_cfg = config["training"]
     model_cfg = config["model"]
 
-    # ── build models ──────────────────────────────────────────────────
+    # ── Load backbone on CPU ──────────────────────────────────────────
     from hypnos.model.backbone import MambaBackbone
-    from hypnos.model.thought_block import ThoughtBlock
-    from hypnos.model.ema_teacher import EMATeacher
 
-    # Backbone stays on CPU — Mamba's sequential scan doesn't compile
-    # on XLA (hangs). Since backbone is frozen, CPU is fine. We only
-    # transfer the small hidden states (B, 2048) to TPU.
-    cpu_device = torch.device("cpu")
     backbone = MambaBackbone(
         model_cfg.get("backbone", "state-spaces/mamba-1.4b-hf"),
         use_slow_path=model_cfg.get("use_slow_path", True),
     )
-    backbone.to(cpu_device)
+    backbone.to(torch.device("cpu"))
     for param in backbone.parameters():
         param.requires_grad_(False)
     backbone.eval()
-    print("[Stage1-TPU] Backbone on CPU (frozen, avoids XLA compilation)")
 
-    # Trainable components on TPU
+    # ── Phase 1: cache embeddings on CPU ──────────────────────────────
+    hidden_ctx, hidden_tgt = precache_backbone_embeddings(
+        backbone, backbone.tokenizer, config
+    )
+
+    # Free backbone memory — no longer needed
+    del backbone
+    torch.cuda.empty_cache() if torch.cuda.is_available() else None
+    import gc; gc.collect()
+    print("[Stage1-TPU] Backbone freed from memory.")
+
+    # ── Phase 2: TPU training on cached embeddings ────────────────────
+    print("[Stage1-TPU] ═══ Phase 2: Training ThoughtBlock on TPU ═══")
+
+    # Enable SPMD mode
+    xr.use_spmd()
+    device = xm.xla_device()
+    num_devices = xr.global_runtime_device_count()
+    print(f"[Stage1-TPU] Device: {device} | TPU chips: {num_devices}")
+
+    # Create 1D mesh for data parallelism
+    mesh = Mesh(
+        np.arange(num_devices),
+        (num_devices,),
+        ("data",),
+    )
+
+    # ── build trainable models (TPU only) ─────────────────────────────
+    from hypnos.model.thought_block import ThoughtBlock
+    from hypnos.model.ema_teacher import EMATeacher
+
+    hidden_size = hidden_ctx.shape[-1]  # 2048
+
     thought_block = ThoughtBlock(
-        input_dim=backbone.hidden_size,
+        input_dim=hidden_size,
         latent_dim=model_cfg.get("latent_dim", 512),
         k_steps=model_cfg.get("k_steps", 8),
     ).to(device)
@@ -227,20 +280,16 @@ def train_stage1_tpu(config_path: str):
         tau=model_cfg.get("ema_tau", 0.999),
     ).to(device)
 
-    print("[Stage1-TPU] ThoughtBlock + EMATeacher on TPU")
-
-    # ── data pipeline ─────────────────────────────────────────────────
-    # Global batch size — SPMD shards this across chips automatically
+    # ── data pipeline from cached embeddings ──────────────────────────
     global_batch_size = train_cfg["batch_size"] * num_devices
 
-    dataset = FixedLengthTextDataset(backbone.tokenizer, config)
-
+    cached_dataset = TensorDataset(hidden_ctx, hidden_tgt)
     dataloader = DataLoader(
-        dataset,
+        cached_dataset,
         batch_size=global_batch_size,
         shuffle=True,
         drop_last=True,
-        num_workers=4,
+        num_workers=2,
     )
 
     # ── optimizer + scheduler ─────────────────────────────────────────
@@ -258,7 +307,7 @@ def train_stage1_tpu(config_path: str):
     checkpoint_dir = Path("checkpoints/stage1")
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-    # ── training loop ─────────────────────────────────────────────────
+    # ── training loop (fully on TPU) ──────────────────────────────────
     total_loss = 0.0
     start_time = time.time()
     global_step = 0
@@ -271,36 +320,32 @@ def train_stage1_tpu(config_path: str):
         f"Global batch: {global_batch_size} | "
         f"SPMD across {num_devices} chips"
     )
+    print("[Stage1-TPU] All computation now on TPU — expect ~0.1-0.5s/step")
     sys.stdout.flush()
 
-    for epoch in range(100):  # max epochs (will break by max_steps)
-        for context_ids, target_ids in dataloader:
+    for epoch in range(500):  # max epochs (will break by max_steps)
+        for h_ctx, h_tgt in dataloader:
             if global_step >= train_cfg["max_steps"]:
                 break
 
-            # ── backbone encode on CPU (avoids XLA compilation) ───────
-            with torch.no_grad():
-                hidden_ctx, _ = backbone.encode(context_ids)
-                hidden_tgt, _ = backbone.encode(target_ids)
-
-            # ── transfer hidden states to TPU ─────────────────────────
-            hidden_ctx = hidden_ctx.to(device)
-            hidden_tgt = hidden_tgt.to(device)
+            # Move cached embeddings to TPU
+            h_ctx = h_ctx.to(device)
+            h_tgt = h_tgt.to(device)
 
             # Shard across TPU chips
-            xs.mark_sharding(hidden_ctx, mesh, ("data", None))
-            xs.mark_sharding(hidden_tgt, mesh, ("data", None))
+            xs.mark_sharding(h_ctx, mesh, ("data", None))
+            xs.mark_sharding(h_tgt, mesh, ("data", None))
 
             optimizer.zero_grad()
 
-            # student path (on TPU)
-            z_student, _ = thought_block(hidden_ctx)
+            # student path
+            z_student, _ = thought_block(h_ctx)
 
-            # teacher path (on TPU, no grad)
+            # teacher path (no grad)
             with torch.no_grad():
-                z_teacher, _ = ema_teacher(hidden_tgt)
+                z_teacher, _ = ema_teacher(h_tgt)
 
-            # loss + backward (on TPU)
+            # loss + backward
             loss = jepa_loss(z_student, z_teacher)
             loss.backward()
 
@@ -321,16 +366,20 @@ def train_stage1_tpu(config_path: str):
             global_step += 1
 
             # logging
-            if global_step % train_cfg.get("log_every", 50) == 0:
+            if global_step % train_cfg.get("log_every", 5) == 0:
                 avg_loss = total_loss / global_step
                 elapsed = time.time() - start_time
+                steps_per_sec = global_step / elapsed
+                eta = (train_cfg["max_steps"] - global_step) / steps_per_sec
                 print(
                     f"[Stage1-TPU] Step {global_step:>5d} | "
                     f"Loss: {loss.item():.4f} | "
                     f"Avg: {avg_loss:.4f} | "
                     f"LR: {scheduler.get_last_lr()[0]:.2e} | "
-                    f"Time: {elapsed:.0f}s"
+                    f"{steps_per_sec:.1f} steps/s | "
+                    f"ETA: {eta:.0f}s"
                 )
+                sys.stdout.flush()
 
             # checkpointing
             if global_step % train_cfg.get("checkpoint_every", 500) == 0:
@@ -361,7 +410,9 @@ def train_stage1_tpu(config_path: str):
         },
         str(final_path),
     )
-    print(f"[Stage1-TPU] Training complete. Final checkpoint: {final_path}")
+    elapsed = time.time() - start_time
+    print(f"[Stage1-TPU] ═══ Training complete in {elapsed:.0f}s ═══")
+    print(f"[Stage1-TPU] Final checkpoint: {final_path}")
 
 
 # ── CLI ───────────────────────────────────────────────────────────────

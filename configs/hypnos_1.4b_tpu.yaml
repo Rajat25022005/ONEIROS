@@ -35,7 +35,7 @@ training:
   dataset: "HuggingFaceFW/fineweb-edu"
   dataset_config: "sample-10BT"    
   dataset_split: "train[:100000]"  
-  log_every: 50
+  log_every: 5
 
   tpu: true
   num_cores: 8
