@@ -1,9 +1,9 @@
 """
 train/stage1_jepa_tpu.py — Stage 1: JEPA pre-training on TPU v5e-8
 
-Multi-core TPU training of the ThoughtBlock to predict future latent
-states, supervised by the EMA teacher's coherence signal.  Uses
-PyTorch/XLA with xmp.spawn for 8-core data parallelism.
+Single-process SPMD training of the ThoughtBlock to predict future
+latent states, supervised by the EMA teacher's coherence signal.
+Uses PyTorch/XLA SPMD to shard data across all 8 TPU chips automatically.
 
 Backbone is frozen — we only train reasoning, not world knowledge.
 
@@ -19,17 +19,14 @@ import argparse
 import time
 from pathlib import Path
 
+import numpy as np
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader, Dataset
-
-import torch_xla
-import torch_xla.core.xla_model as xm
-import torch_xla.distributed.xla_multiprocessing as xmp
-import torch_xla.distributed.parallel_loader as pl
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -114,7 +111,7 @@ class FixedLengthTextDataset(Dataset):
         train_cfg = config["training"]
         self.max_seq_len = train_cfg["max_seq_len"]
 
-        xm.master_print("[Stage1-TPU] Loading and tokenizing dataset...")
+        print("[Stage1-TPU] Loading and tokenizing dataset...")
 
         dataset_name = train_cfg.get("dataset", "HuggingFaceFW/fineweb-edu")
         dataset_config = train_cfg.get("dataset_config", None)
@@ -147,7 +144,7 @@ class FixedLengthTextDataset(Dataset):
         ds.set_format("torch")
 
         self.input_ids = ds["input_ids"]
-        xm.master_print(
+        print(
             f"[Stage1-TPU] Dataset ready: {len(self.input_ids)} examples, "
             f"fixed length {self.max_seq_len}"
         )
@@ -163,24 +160,41 @@ class FixedLengthTextDataset(Dataset):
         return context, target
 
 
-# ── Training process (runs on each TPU core) ─────────────────────────
+# ── Training ─────────────────────────────────────────────────────────
 
-def _mp_fn(index, config_path):
+def train_stage1_tpu(config_path: str):
     """
-    Per-core training function. Called by xmp.spawn on each of the 8 cores.
+    Stage 1 JEPA training using SPMD on TPU v5e-8.
 
-    IMPORTANT: All XLA device operations MUST happen inside this function,
-    not in global scope — otherwise Kaggle will raise BrokenProcessPool.
+    SPMD (Single Program Multiple Data) runs as a single process.
+    The XLA compiler automatically shards data across all 8 TPU chips
+    based on sharding annotations — no xmp.spawn needed.
     """
+    import torch_xla
+    import torch_xla.core.xla_model as xm
+    import torch_xla.runtime as xr
+    import torch_xla.distributed.spmd as xs
+    from torch_xla.distributed.spmd import Mesh
+
+    # Enable SPMD mode — must be called before any XLA tensor creation
+    xr.use_spmd()
+
+    device = xm.xla_device()
+    num_devices = xr.global_runtime_device_count()
+    print(f"[Stage1-TPU] Device: {device} | TPU chips: {num_devices}")
+
+    # Create 1D mesh for data parallelism across all chips
+    mesh = Mesh(
+        np.arange(num_devices),
+        (num_devices,),
+        ("data",),
+    )
+
     with open(config_path) as f:
         config = yaml.safe_load(f)
 
     train_cfg = config["training"]
     model_cfg = config["model"]
-
-    # ── device ────────────────────────────────────────────────────────
-    device = xm.xla_device()
-    xm.master_print(f"[Stage1-TPU] Core {index} using device: {device}")
 
     # ── build models ──────────────────────────────────────────────────
     from hypnos.model.backbone import MambaBackbone
@@ -210,25 +224,18 @@ def _mp_fn(index, config_path):
     backbone.eval()
 
     # ── data pipeline ─────────────────────────────────────────────────
-    dataset = FixedLengthTextDataset(backbone.tokenizer, config)
+    # Global batch size — SPMD shards this across chips automatically
+    global_batch_size = train_cfg["batch_size"] * num_devices
 
-    sampler = torch.utils.data.distributed.DistributedSampler(
-        dataset,
-        num_replicas=xm.xrt_world_size(),
-        rank=xm.get_ordinal(),
-        shuffle=True,
-    )
+    dataset = FixedLengthTextDataset(backbone.tokenizer, config)
 
     dataloader = DataLoader(
         dataset,
-        batch_size=train_cfg["batch_size"],
-        sampler=sampler,
+        batch_size=global_batch_size,
+        shuffle=True,
         drop_last=True,
-        num_workers=2,
+        num_workers=4,
     )
-
-    # MpDeviceLoader pipelines host → TPU data transfer
-    para_loader = pl.MpDeviceLoader(dataloader, device)
 
     # ── optimizer + scheduler ─────────────────────────────────────────
     optimizer = AdamW(
@@ -243,29 +250,34 @@ def _mp_fn(index, config_path):
 
     # ── checkpointing setup ───────────────────────────────────────────
     checkpoint_dir = Path("checkpoints/stage1")
-    if xm.is_master_ordinal():
-        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     # ── training loop ─────────────────────────────────────────────────
     total_loss = 0.0
     start_time = time.time()
     global_step = 0
 
-    xm.master_print(
-        f"[Stage1-TPU] Starting JEPA training for {train_cfg['max_steps']} steps "
-        f"across {xm.xrt_world_size()} TPU cores..."
+    print(
+        f"[Stage1-TPU] Starting JEPA training for {train_cfg['max_steps']} steps..."
     )
-    xm.master_print(
-        f"[Stage1-TPU] Per-core batch: {train_cfg['batch_size']} | "
-        f"Global batch: {train_cfg['batch_size'] * xm.xrt_world_size()}"
+    print(
+        f"[Stage1-TPU] Per-chip batch: {train_cfg['batch_size']} | "
+        f"Global batch: {global_batch_size} | "
+        f"SPMD across {num_devices} chips"
     )
 
     for epoch in range(100):  # max epochs (will break by max_steps)
-        sampler.set_epoch(epoch)
-
-        for context_ids, target_ids in para_loader:
+        for context_ids, target_ids in dataloader:
             if global_step >= train_cfg["max_steps"]:
                 break
+
+            # Move to XLA device
+            context_ids = context_ids.to(device)
+            target_ids = target_ids.to(device)
+
+            # Shard batch across TPU chips (data parallelism)
+            xs.mark_sharding(context_ids, mesh, ("data", None))
+            xs.mark_sharding(target_ids, mesh, ("data", None))
 
             optimizer.zero_grad()
 
@@ -289,22 +301,21 @@ def _mp_fn(index, config_path):
                 train_cfg["grad_clip"],
             )
 
-            # XLA optimizer step — handles gradient all-reduce across cores
-            xm.optimizer_step(optimizer)
+            optimizer.step()
             scheduler.step()
 
-            # EMA update + mark_step to materialize lazy tensors
+            # EMA update
             ema_teacher.update(thought_block)
             xm.mark_step()
 
             total_loss += loss.item()
             global_step += 1
 
-            # logging (master only)
+            # logging
             if global_step % train_cfg.get("log_every", 50) == 0:
                 avg_loss = total_loss / global_step
                 elapsed = time.time() - start_time
-                xm.master_print(
+                print(
                     f"[Stage1-TPU] Step {global_step:>5d} | "
                     f"Loss: {loss.item():.4f} | "
                     f"Avg: {avg_loss:.4f} | "
@@ -312,52 +323,36 @@ def _mp_fn(index, config_path):
                     f"Time: {elapsed:.0f}s"
                 )
 
-            # checkpointing (master only)
+            # checkpointing
             if global_step % train_cfg.get("checkpoint_every", 500) == 0:
-                if xm.is_master_ordinal():
-                    ckpt_path = checkpoint_dir / f"stage1_step{global_step}.pt"
-                    xm.save(
-                        {
-                            "thought_block": thought_block.state_dict(),
-                            "ema_teacher": ema_teacher.teacher.state_dict(),
-                            "optimizer": optimizer.state_dict(),
-                            "step": global_step,
-                            "loss": total_loss / global_step,
-                        },
-                        str(ckpt_path),
-                    )
-                    xm.master_print(
-                        f"[Stage1-TPU] Checkpoint saved: {ckpt_path}"
-                    )
-                # sync all cores after checkpoint
-                xm.rendezvous("checkpoint")
+                ckpt_path = checkpoint_dir / f"stage1_step{global_step}.pt"
+                xm.save(
+                    {
+                        "thought_block": thought_block.state_dict(),
+                        "ema_teacher": ema_teacher.teacher.state_dict(),
+                        "optimizer": optimizer.state_dict(),
+                        "step": global_step,
+                        "loss": total_loss / global_step,
+                    },
+                    str(ckpt_path),
+                )
+                print(f"[Stage1-TPU] Checkpoint saved: {ckpt_path}")
 
         if global_step >= train_cfg["max_steps"]:
             break
 
     # ── final save ────────────────────────────────────────────────────
-    if xm.is_master_ordinal():
-        final_path = checkpoint_dir / "stage1_final.pt"
-        xm.save(
-            {
-                "thought_block": thought_block.state_dict(),
-                "ema_teacher": ema_teacher.teacher.state_dict(),
-                "step": global_step,
-                "loss": total_loss / max(global_step, 1),
-            },
-            str(final_path),
-        )
-        xm.master_print(
-            f"[Stage1-TPU] Training complete. Final checkpoint: {final_path}"
-        )
-    xm.rendezvous("training_done")
-
-
-# ── Public API ────────────────────────────────────────────────────────
-
-def train_stage1_tpu(config_path: str):
-    """Launch Stage 1 JEPA training across all TPU cores."""
-    xmp.spawn(_mp_fn, args=(config_path,), start_method="fork")
+    final_path = checkpoint_dir / "stage1_final.pt"
+    xm.save(
+        {
+            "thought_block": thought_block.state_dict(),
+            "ema_teacher": ema_teacher.teacher.state_dict(),
+            "step": global_step,
+            "loss": total_loss / max(global_step, 1),
+        },
+        str(final_path),
+    )
+    print(f"[Stage1-TPU] Training complete. Final checkpoint: {final_path}")
 
 
 # ── CLI ───────────────────────────────────────────────────────────────

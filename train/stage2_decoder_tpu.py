@@ -1,9 +1,9 @@
 """
 train/stage2_decoder_tpu.py — Stage 2: Decoder training on TPU v5e-8
 
-Multi-core TPU training of the LatentDecoder to convert ThoughtBlock's
-latent output z_K back into readable text.  Uses PyTorch/XLA with
-xmp.spawn for 8-core data parallelism.
+Single-process SPMD training of the LatentDecoder to convert ThoughtBlock's
+latent output z_K back into readable text.  Uses PyTorch/XLA SPMD to
+shard data across all 8 TPU chips automatically.
 
 Backbone and ThoughtBlock are frozen — only the decoder learns.
 
@@ -19,17 +19,14 @@ import argparse
 import time
 from pathlib import Path
 
+import numpy as np
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader, Dataset
-
-import torch_xla
-import torch_xla.core.xla_model as xm
-import torch_xla.distributed.xla_multiprocessing as xmp
-import torch_xla.distributed.parallel_loader as pl
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -50,7 +47,7 @@ class FixedLengthTextDataset(Dataset):
         train_cfg = config["training"]
         self.max_seq_len = train_cfg["max_seq_len"]
 
-        xm.master_print("[Stage2-TPU] Loading and tokenizing dataset...")
+        print("[Stage2-TPU] Loading and tokenizing dataset...")
 
         dataset_name = train_cfg.get("dataset", "HuggingFaceFW/fineweb-edu")
         dataset_config = train_cfg.get("dataset_config", None)
@@ -83,7 +80,7 @@ class FixedLengthTextDataset(Dataset):
         ds.set_format("torch")
 
         self.input_ids = ds["input_ids"]
-        xm.master_print(
+        print(
             f"[Stage2-TPU] Dataset ready: {len(self.input_ids)} examples, "
             f"fixed length {self.max_seq_len}"
         )
@@ -99,11 +96,13 @@ class FixedLengthTextDataset(Dataset):
         return context, target
 
 
-# ── Sample generation (master only) ──────────────────────────────────
+# ── Sample generation ─────────────────────────────────────────────────
 
 @torch.no_grad()
 def _sample_generation(backbone, thought_block, decoder, device):
-    """Generate a sample to monitor training quality (master core only)."""
+    """Generate a sample to monitor training quality."""
+    import torch_xla.core.xla_model as xm
+
     prompts = [
         "Once upon a time",
         "The sun was setting",
@@ -124,27 +123,47 @@ def _sample_generation(backbone, thought_block, decoder, device):
     else:
         text = str(output_ids[0].tolist()[:20])
 
-    xm.master_print(f'[Stage2-TPU] Sample: "{prompt}" → "{text[:80]}..."')
+    print(f'[Stage2-TPU] Sample: "{prompt}" → "{text[:80]}..."')
 
 
-# ── Training process (runs on each TPU core) ─────────────────────────
+# ── Training ─────────────────────────────────────────────────────────
 
-def _mp_fn(index, config_path, stage1_checkpoint):
+def train_stage2_tpu(
+    config_path: str,
+    stage1_checkpoint: str = None,
+):
     """
-    Per-core training function. Called by xmp.spawn on each of the 8 cores.
+    Stage 2 Decoder training using SPMD on TPU v5e-8.
 
-    IMPORTANT: All XLA device operations MUST happen inside this function,
-    not in global scope — otherwise Kaggle will raise BrokenProcessPool.
+    SPMD (Single Program Multiple Data) runs as a single process.
+    The XLA compiler automatically shards data across all 8 TPU chips
+    based on sharding annotations — no xmp.spawn needed.
     """
+    import torch_xla
+    import torch_xla.core.xla_model as xm
+    import torch_xla.runtime as xr
+    import torch_xla.distributed.spmd as xs
+    from torch_xla.distributed.spmd import Mesh
+
+    # Enable SPMD mode — must be called before any XLA tensor creation
+    xr.use_spmd()
+
+    device = xm.xla_device()
+    num_devices = xr.global_runtime_device_count()
+    print(f"[Stage2-TPU] Device: {device} | TPU chips: {num_devices}")
+
+    # Create 1D mesh for data parallelism across all chips
+    mesh = Mesh(
+        np.arange(num_devices),
+        (num_devices,),
+        ("data",),
+    )
+
     with open(config_path) as f:
         config = yaml.safe_load(f)
 
     train_cfg = config["training"]
     model_cfg = config["model"]
-
-    # ── device ────────────────────────────────────────────────────────
-    device = xm.xla_device()
-    xm.master_print(f"[Stage2-TPU] Core {index} using device: {device}")
 
     # ── build models ──────────────────────────────────────────────────
     from hypnos.model.backbone import MambaBackbone
@@ -179,15 +198,11 @@ def _mp_fn(index, config_path, stage1_checkpoint):
     if os.path.exists(ckpt_path):
         ckpt = torch.load(ckpt_path, map_location="cpu")
         thought_block.load_state_dict(ckpt["thought_block"])
-        xm.master_print(f"[Stage2-TPU] Loaded Stage 1 checkpoint: {ckpt_path}")
-        xm.master_print(f"[Stage2-TPU] Stage 1 loss was: {ckpt.get('loss', 'N/A')}")
+        print(f"[Stage2-TPU] Loaded Stage 1 checkpoint: {ckpt_path}")
+        print(f"[Stage2-TPU] Stage 1 loss was: {ckpt.get('loss', 'N/A')}")
     else:
-        xm.master_print(
-            f"[Stage2-TPU] Warning: No Stage 1 checkpoint at {ckpt_path}"
-        )
-        xm.master_print(
-            "[Stage2-TPU] Training decoder with untrained ThoughtBlock."
-        )
+        print(f"[Stage2-TPU] Warning: No Stage 1 checkpoint at {ckpt_path}")
+        print("[Stage2-TPU] Training decoder with untrained ThoughtBlock.")
 
     # ── freeze backbone + thought block ───────────────────────────────
     for param in backbone.parameters():
@@ -199,28 +214,21 @@ def _mp_fn(index, config_path, stage1_checkpoint):
     thought_block.eval()
 
     trainable_params = sum(p.numel() for p in decoder.parameters())
-    xm.master_print(f"[Stage2-TPU] Decoder trainable params: {trainable_params:,}")
+    print(f"[Stage2-TPU] Decoder trainable params: {trainable_params:,}")
 
     # ── data pipeline ─────────────────────────────────────────────────
-    dataset = FixedLengthTextDataset(backbone.tokenizer, config)
+    # Global batch size — SPMD shards this across chips automatically
+    global_batch_size = train_cfg["batch_size"] * num_devices
 
-    sampler = torch.utils.data.distributed.DistributedSampler(
-        dataset,
-        num_replicas=xm.xrt_world_size(),
-        rank=xm.get_ordinal(),
-        shuffle=True,
-    )
+    dataset = FixedLengthTextDataset(backbone.tokenizer, config)
 
     dataloader = DataLoader(
         dataset,
-        batch_size=train_cfg["batch_size"],
-        sampler=sampler,
+        batch_size=global_batch_size,
+        shuffle=True,
         drop_last=True,
-        num_workers=2,
+        num_workers=4,
     )
-
-    # MpDeviceLoader pipelines host → TPU data transfer
-    para_loader = pl.MpDeviceLoader(dataloader, device)
 
     # ── optimizer + scheduler ─────────────────────────────────────────
     max_steps = train_cfg.get("max_steps", 5000)
@@ -234,8 +242,7 @@ def _mp_fn(index, config_path, stage1_checkpoint):
 
     # ── checkpointing setup ───────────────────────────────────────────
     checkpoint_dir = Path("checkpoints/stage2")
-    if xm.is_master_ordinal():
-        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     # ── training loop ─────────────────────────────────────────────────
     total_loss = 0.0
@@ -243,21 +250,27 @@ def _mp_fn(index, config_path, stage1_checkpoint):
     global_step = 0
     decoder.train()
 
-    xm.master_print(
-        f"[Stage2-TPU] Starting decoder training for {max_steps} steps "
-        f"across {xm.xrt_world_size()} TPU cores..."
+    print(
+        f"[Stage2-TPU] Starting decoder training for {max_steps} steps..."
     )
-    xm.master_print(
-        f"[Stage2-TPU] Per-core batch: {train_cfg['batch_size']} | "
-        f"Global batch: {train_cfg['batch_size'] * xm.xrt_world_size()}"
+    print(
+        f"[Stage2-TPU] Per-chip batch: {train_cfg['batch_size']} | "
+        f"Global batch: {global_batch_size} | "
+        f"SPMD across {num_devices} chips"
     )
 
     for epoch in range(100):  # max epochs (will break by max_steps)
-        sampler.set_epoch(epoch)
-
-        for context_ids, target_ids in para_loader:
+        for context_ids, target_ids in dataloader:
             if global_step >= max_steps:
                 break
+
+            # Move to XLA device
+            context_ids = context_ids.to(device)
+            target_ids = target_ids.to(device)
+
+            # Shard batch across TPU chips (data parallelism)
+            xs.mark_sharding(context_ids, mesh, ("data", None))
+            xs.mark_sharding(target_ids, mesh, ("data", None))
 
             optimizer.zero_grad()
 
@@ -287,22 +300,21 @@ def _mp_fn(index, config_path, stage1_checkpoint):
                 train_cfg.get("grad_clip", 1.0),
             )
 
-            # XLA optimizer step — handles gradient all-reduce across cores
-            xm.optimizer_step(optimizer)
+            optimizer.step()
             scheduler.step()
             xm.mark_step()
 
             total_loss += loss.item()
             global_step += 1
 
-            # ── logging (master only) ─────────────────────────────────
+            # ── logging ───────────────────────────────────────────────
             if global_step % train_cfg.get("log_every", 50) == 0:
                 avg_loss = total_loss / global_step
                 elapsed = time.time() - start_time
                 perplexity = min(
                     torch.exp(torch.tensor(avg_loss)).item(), 1e6
                 )
-                xm.master_print(
+                print(
                     f"[Stage2-TPU] Step {global_step:>5d} | "
                     f"Loss: {loss.item():.4f} | "
                     f"Avg: {avg_loss:.4f} | "
@@ -311,64 +323,40 @@ def _mp_fn(index, config_path, stage1_checkpoint):
                     f"Time: {elapsed:.0f}s"
                 )
 
-                # sample generation every 200 steps (master only)
-                if global_step % 200 == 0 and xm.is_master_ordinal():
+                # sample generation every 200 steps
+                if global_step % 200 == 0:
                     _sample_generation(
                         backbone, thought_block, decoder, device
                     )
 
-            # ── checkpointing (master only) ───────────────────────────
+            # ── checkpointing ─────────────────────────────────────────
             if global_step % train_cfg.get("checkpoint_every", 500) == 0:
-                if xm.is_master_ordinal():
-                    ckpt_path = (
-                        checkpoint_dir / f"stage2_step{global_step}.pt"
-                    )
-                    xm.save(
-                        {
-                            "decoder": decoder.state_dict(),
-                            "optimizer": optimizer.state_dict(),
-                            "step": global_step,
-                            "loss": total_loss / global_step,
-                        },
-                        str(ckpt_path),
-                    )
-                    xm.master_print(
-                        f"[Stage2-TPU] Checkpoint saved: {ckpt_path}"
-                    )
-                xm.rendezvous("checkpoint")
+                ckpt_path = checkpoint_dir / f"stage2_step{global_step}.pt"
+                xm.save(
+                    {
+                        "decoder": decoder.state_dict(),
+                        "optimizer": optimizer.state_dict(),
+                        "step": global_step,
+                        "loss": total_loss / global_step,
+                    },
+                    str(ckpt_path),
+                )
+                print(f"[Stage2-TPU] Checkpoint saved: {ckpt_path}")
 
         if global_step >= max_steps:
             break
 
     # ── final save ────────────────────────────────────────────────────
-    if xm.is_master_ordinal():
-        final_path = checkpoint_dir / "stage2_final.pt"
-        xm.save(
-            {
-                "decoder": decoder.state_dict(),
-                "step": global_step,
-                "loss": total_loss / max(global_step, 1),
-            },
-            str(final_path),
-        )
-        xm.master_print(
-            f"[Stage2-TPU] Training complete. Final checkpoint: {final_path}"
-        )
-    xm.rendezvous("training_done")
-
-
-# ── Public API ────────────────────────────────────────────────────────
-
-def train_stage2_tpu(
-    config_path: str,
-    stage1_checkpoint: str = None,
-):
-    """Launch Stage 2 Decoder training across all TPU cores."""
-    xmp.spawn(
-        _mp_fn,
-        args=(config_path, stage1_checkpoint),
-        start_method="fork",
+    final_path = checkpoint_dir / "stage2_final.pt"
+    xm.save(
+        {
+            "decoder": decoder.state_dict(),
+            "step": global_step,
+            "loss": total_loss / max(global_step, 1),
+        },
+        str(final_path),
     )
+    print(f"[Stage2-TPU] Training complete. Final checkpoint: {final_path}")
 
 
 # ── CLI ───────────────────────────────────────────────────────────────
