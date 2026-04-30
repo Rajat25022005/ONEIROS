@@ -367,7 +367,6 @@ def train_stage2_tpu(
     xmp.spawn(
         _mp_fn,
         args=(config_path, stage1_checkpoint),
-        nprocs=8,
         start_method="fork",
     )
 

@@ -357,7 +357,7 @@ def _mp_fn(index, config_path):
 
 def train_stage1_tpu(config_path: str):
     """Launch Stage 1 JEPA training across all TPU cores."""
-    xmp.spawn(_mp_fn, args=(config_path,), nprocs=8, start_method="fork")
+    xmp.spawn(_mp_fn, args=(config_path,), start_method="fork")
 
 
 # ── CLI ───────────────────────────────────────────────────────────────
