@@ -29,21 +29,68 @@ from hypnos.model.thought_block import ThoughtBlock
 from hypnos.model.ema_teacher import EMATeacher
 
 
-# ── JEPA loss ─────────────────────────────────────────────────────────
+# ── JEPA loss with anti-collapse regularization ──────────────────────
+
+def variance_loss(z: torch.Tensor, gamma: float = 1.0) -> torch.Tensor:
+    """
+    Variance regularization (from VICReg).
+
+    Forces each dimension of the representation to have std >= gamma.
+    Without this, the model can collapse all representations to a single
+    point and achieve zero invariance loss trivially.
+    """
+    std = z.std(dim=0)
+    return F.relu(gamma - std).mean()
+
+
+def covariance_loss(z: torch.Tensor) -> torch.Tensor:
+    """
+    Covariance regularization (from VICReg).
+
+    Decorrelates the dimensions of the representation. Without this,
+    the model can achieve low invariance loss by using only a few
+    dimensions (dimensional collapse).
+    """
+    batch_size, dim = z.shape
+    z_centered = z - z.mean(dim=0)
+    cov = (z_centered.T @ z_centered) / (batch_size - 1)
+
+    # zero out the diagonal (we only penalize off-diagonal correlations)
+    off_diag = cov - torch.diag(cov.diag())
+    return (off_diag ** 2).sum() / dim
+
 
 def jepa_loss(
     z_student: torch.Tensor,
     z_teacher: torch.Tensor,
+    var_weight: float = 1.0,
+    cov_weight: float = 0.04,
 ) -> torch.Tensor:
     """
-    JEPA loss: smooth L1 between normalized student and teacher latents.
+    JEPA loss with VICReg-style anti-collapse regularization.
 
-    Normalization prevents the trivial collapse-to-zero solution.
-    Smooth L1 (Huber) is robust to outliers.
+    Components:
+      1. Invariance: smooth L1 between normalized student/teacher (original)
+      2. Variance:   force each latent dim to have non-trivial spread
+      3. Covariance: decorrelate latent dims to prevent dimensional collapse
+
+    Without (2) and (3), the loss collapses to ~0 as the student learns
+    to map all inputs to the same point in latent space.
     """
     z_s = F.normalize(z_student, dim=-1)
     z_t = F.normalize(z_teacher, dim=-1)
-    return F.smooth_l1_loss(z_s, z_t)
+
+    # invariance: student should match teacher
+    inv_loss = F.smooth_l1_loss(z_s, z_t)
+
+    # variance: prevent representation collapse
+    var_loss = variance_loss(z_s) + variance_loss(z_t)
+
+    # covariance: prevent dimensional collapse
+    cov_loss = covariance_loss(z_s) + covariance_loss(z_t)
+
+    total = inv_loss + var_weight * var_loss + cov_weight * cov_loss
+    return total
 
 
 # ── data ──────────────────────────────────────────────────────────────
