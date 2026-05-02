@@ -110,8 +110,9 @@ def get_batches(backbone, config, device):
         from datasets import load_dataset
 
         dataset = load_dataset(
-            train_cfg.get("dataset", "roneneldan/TinyStories"),
-            split="train",
+            train_cfg.get("dataset", "HuggingFaceFW/fineweb-edu"),
+            name=train_cfg.get("dataset_config", None),
+            split=train_cfg.get("dataset_split", "train"),
             streaming=True,
         )
 

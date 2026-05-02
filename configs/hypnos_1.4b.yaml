@@ -13,6 +13,7 @@ model:
   vocab_size: 50280            # Mamba-1.4B uses 50280 vocab
   decoder_hidden: 1024         # scaled up for bigger latent space
   max_length: 128
+  use_slow_path: false         # use CUDA kernels on GPU
 
 state:
   dir: ".hypnos/state"
@@ -39,5 +40,7 @@ training:
   max_seq_len: 512
   checkpoint_every: 500
   dataset: "HuggingFaceFW/fineweb-edu"
+  dataset_config: "sample-10BT"
+  dataset_split: "train[:100000]"
   log_every: 50
   multi_gpu: true

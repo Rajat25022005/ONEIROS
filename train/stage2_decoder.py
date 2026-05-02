@@ -46,8 +46,9 @@ def get_batches(backbone, config, device):
         from datasets import load_dataset
 
         dataset = load_dataset(
-            train_cfg.get("dataset", "roneneldan/TinyStories"),
-            split="train",
+            train_cfg.get("dataset", "HuggingFaceFW/fineweb-edu"),
+            name=train_cfg.get("dataset_config", None),
+            split=train_cfg.get("dataset_split", "train"),
             streaming=True,
         )
 
@@ -116,7 +117,8 @@ def train_stage2(config_path: str, stage1_checkpoint: str = None):
     # ── build models ──────────────────────────────────────────────────
 
     backbone = MambaBackbone(
-        model_cfg.get("backbone", "state-spaces/mamba-130m-hf")
+        model_cfg.get("backbone", "state-spaces/mamba-1.4b-hf"),
+        use_slow_path=model_cfg.get("use_slow_path", False),
     )
     backbone.to(device)
 
