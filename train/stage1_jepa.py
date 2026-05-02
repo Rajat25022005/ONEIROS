@@ -63,7 +63,7 @@ def covariance_loss(z: torch.Tensor) -> torch.Tensor:
 def jepa_loss(
     z_student: torch.Tensor,
     z_teacher: torch.Tensor,
-    var_weight: float = 1.0,
+    var_weight: float = 0.25,
     cov_weight: float = 0.04,
 ) -> torch.Tensor:
     """
