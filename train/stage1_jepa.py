@@ -163,6 +163,57 @@ def get_batches(backbone, config, device):
             yield context, target
 
 
+# ── dataset ───────────────────────────────────────────────────────────
+
+class FixedLengthDataset(torch.utils.data.Dataset):
+    """Pre-tokenized dataset with fixed sequence length for GPU training."""
+
+    def __init__(self, config, tokenizer):
+        from datasets import load_dataset
+
+        train_cfg = config["training"]
+        max_seq_len = train_cfg["max_seq_len"]
+
+        print("[Stage1] Loading and tokenizing dataset...")
+
+        ds = load_dataset(
+            train_cfg.get("dataset", "HuggingFaceFW/fineweb-edu"),
+            name=train_cfg.get("dataset_config", None),
+            split=train_cfg.get("dataset_split", "train"),
+        )
+
+        def tokenize_fn(examples):
+            tokens = tokenizer(
+                examples["text"],
+                truncation=True,
+                padding="max_length",
+                max_length=max_seq_len,
+                return_tensors=None,
+            )
+            return {"input_ids": tokens["input_ids"]}
+
+        ds = ds.map(
+            tokenize_fn,
+            batched=True,
+            batch_size=1000,
+            remove_columns=ds.column_names,
+            desc="Tokenizing",
+            num_proc=4,
+        )
+        ds.set_format("torch")
+
+        self.input_ids = ds["input_ids"]
+        self.mid = max_seq_len // 2
+        print(f"[Stage1] Dataset ready: {len(self.input_ids)} examples")
+
+    def __len__(self):
+        return len(self.input_ids)
+
+    def __getitem__(self, idx):
+        ids = self.input_ids[idx]
+        return ids[:self.mid], ids[self.mid:]
+
+
 # ── training loop ─────────────────────────────────────────────────────
 
 def train_stage1(config_path: str):
@@ -171,23 +222,24 @@ def train_stage1(config_path: str):
 
     train_cfg = config["training"]
     model_cfg = config["model"]
-    device = torch.device(
-        "mps" if torch.backends.mps.is_available()
-        else "cuda" if torch.cuda.is_available()
-        else "cpu"
-    )
-    n_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
-    print(f"[Stage1] Device: {device} | GPUs available: {n_gpus}")
 
-    # build models
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    n_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    print(f"[Stage1] Device: {device} | GPUs: {n_gpus}")
+
+    # ── build models ──────────────────────────────────────────────────
     backbone = MambaBackbone(
-        model_cfg.get("backbone", "state-spaces/mamba-130m-hf")
+        model_cfg.get("backbone", "state-spaces/mamba-1.4b-hf"),
+        use_slow_path=model_cfg.get("use_slow_path", False),
     )
     backbone.to(device)
+    for param in backbone.parameters():
+        param.requires_grad_(False)
+    backbone.eval()
 
     thought_block = ThoughtBlock(
         input_dim=backbone.hidden_size,
-        latent_dim=model_cfg.get("latent_dim", 256),
+        latent_dim=model_cfg.get("latent_dim", 512),
         k_steps=model_cfg.get("k_steps", 8),
     ).to(device)
 
@@ -196,99 +248,129 @@ def train_stage1(config_path: str):
         tau=model_cfg.get("ema_tau", 0.999),
     ).to(device)
 
-    # freeze backbone — only train reasoning
-    for param in backbone.parameters():
-        param.requires_grad_(False)
+    # multi-GPU DataParallel
+    if n_gpus > 1:
+        backbone = nn.DataParallel(backbone)
+        thought_block = nn.DataParallel(thought_block)
+        ema_teacher = nn.DataParallel(ema_teacher)
+        print(f"[Stage1] Using DataParallel across {n_gpus} GPUs")
 
-    # optimizer + scheduler
+    # ── data pipeline ─────────────────────────────────────────────────
+    # Use the backbone's tokenizer; unwrap DataParallel if needed
+    tok = backbone.module.tokenizer if n_gpus > 1 else backbone.tokenizer
+
+    dataset = FixedLengthDataset(config, tok)
+    dataloader = torch.utils.data.DataLoader(
+        dataset,
+        batch_size=train_cfg["batch_size"],
+        shuffle=True,
+        drop_last=True,
+        num_workers=4,          # parallel CPU tokenization/loading
+        pin_memory=True,        # faster CPU→GPU transfer
+        prefetch_factor=2,      # prefetch next batch while GPU trains
+        persistent_workers=True,
+    )
+
+    # ── optimizer + scheduler ─────────────────────────────────────────
     optimizer = AdamW(
-        thought_block.parameters(),
+        (thought_block.module if n_gpus > 1 else thought_block).parameters(),
         lr=train_cfg["learning_rate"],
         weight_decay=train_cfg.get("weight_decay", 0.01),
     )
-    scheduler = CosineAnnealingLR(
-        optimizer,
-        T_max=train_cfg["max_steps"],
-    )
+    scheduler = CosineAnnealingLR(optimizer, T_max=train_cfg["max_steps"])
+    scaler = torch.cuda.amp.GradScaler()  # for bf16/fp16 training
 
-    # checkpointing
+    # ── checkpointing setup ───────────────────────────────────────────
     checkpoint_dir = Path("checkpoints/stage1")
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-    # training
+    # ── training ──────────────────────────────────────────────────────
     total_loss = 0.0
     start_time = time.time()
+    global_step = 0
 
     print(f"[Stage1] Starting JEPA training for {train_cfg['max_steps']} steps...")
+    print(f"[Stage1] Batch size: {train_cfg['batch_size']} | "
+          f"Effective: {train_cfg['batch_size'] * max(n_gpus, 1)}")
 
-    for step, (context_ids, target_ids) in enumerate(
-        get_batches(backbone, config, device)
-    ):
-        if step >= train_cfg["max_steps"]:
+    for epoch in range(100):
+        for context_ids, target_ids in dataloader:
+            if global_step >= train_cfg["max_steps"]:
+                break
+
+            context_ids = context_ids.to(device, non_blocking=True)
+            target_ids = target_ids.to(device, non_blocking=True)
+
+            optimizer.zero_grad()
+
+            # bf16 autocast — keeps GPU tensor cores busy
+            with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+                # student path
+                with torch.no_grad():
+                    hidden_ctx, _ = backbone.encode(context_ids) if not isinstance(backbone, nn.DataParallel) else backbone.module.encode(context_ids)
+                z_student, _ = thought_block(hidden_ctx)
+
+                # teacher path
+                with torch.no_grad():
+                    hidden_tgt, _ = backbone.encode(target_ids) if not isinstance(backbone, nn.DataParallel) else backbone.module.encode(target_ids)
+                    z_teacher, _ = ema_teacher(hidden_tgt)
+
+                loss = jepa_loss(z_student, z_teacher)
+
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(
+                (thought_block.module if n_gpus > 1 else thought_block).parameters(),
+                train_cfg["grad_clip"],
+            )
+            scaler.step(optimizer)
+            scaler.update()
+            scheduler.step()
+            (ema_teacher.module if n_gpus > 1 else ema_teacher).update(
+                thought_block.module if n_gpus > 1 else thought_block
+            )
+
+            total_loss += loss.item()
+            global_step += 1
+
+            # logging
+            if global_step % train_cfg.get("log_every", 50) == 0:
+                avg_loss = total_loss / global_step
+                elapsed = time.time() - start_time
+                steps_per_sec = global_step / elapsed
+                print(
+                    f"[Stage1] Step {global_step:>5d} | "
+                    f"Loss: {loss.item():.4f} | "
+                    f"Avg: {avg_loss:.4f} | "
+                    f"LR: {scheduler.get_last_lr()[0]:.2e} | "
+                    f"{steps_per_sec:.2f} steps/s"
+                )
+
+            # checkpointing
+            if global_step % train_cfg.get("checkpoint_every", 500) == 0:
+                ckpt_path = checkpoint_dir / f"stage1_step{global_step}.pt"
+                torch.save(
+                    {
+                        "thought_block": (thought_block.module if n_gpus > 1 else thought_block).state_dict(),
+                        "ema_teacher": (ema_teacher.module if n_gpus > 1 else ema_teacher).teacher.state_dict(),
+                        "optimizer": optimizer.state_dict(),
+                        "step": global_step,
+                        "loss": total_loss / global_step,
+                    },
+                    ckpt_path,
+                )
+                print(f"[Stage1] Checkpoint saved: {ckpt_path}")
+
+        if global_step >= train_cfg["max_steps"]:
             break
-
-        optimizer.zero_grad()
-
-        # student path
-        hidden_ctx, _ = backbone.encode(context_ids)
-        z_student, _ = thought_block(hidden_ctx)
-
-        # teacher path (no grad)
-        with torch.no_grad():
-            hidden_tgt, _ = backbone.encode(target_ids)
-            z_teacher, _ = ema_teacher(hidden_tgt)
-
-        # loss
-        loss = jepa_loss(z_student, z_teacher)
-        loss.backward()
-
-        # gradient clipping
-        torch.nn.utils.clip_grad_norm_(
-            thought_block.parameters(),
-            train_cfg["grad_clip"],
-        )
-
-        optimizer.step()
-        scheduler.step()
-        ema_teacher.update(thought_block)
-
-        total_loss += loss.item()
-
-        # logging
-        if (step + 1) % train_cfg.get("log_every", 50) == 0:
-            avg_loss = total_loss / (step + 1)
-            elapsed = time.time() - start_time
-            print(
-                f"[Stage1] Step {step + 1:>5d} | "
-                f"Loss: {loss.item():.4f} | "
-                f"Avg: {avg_loss:.4f} | "
-                f"LR: {scheduler.get_last_lr()[0]:.2e} | "
-                f"Time: {elapsed:.0f}s"
-            )
-
-        # checkpointing
-        if (step + 1) % train_cfg.get("checkpoint_every", 1000) == 0:
-            ckpt_path = checkpoint_dir / f"stage1_step{step + 1}.pt"
-            torch.save(
-                {
-                    "thought_block": thought_block.state_dict(),
-                    "ema_teacher": ema_teacher.teacher.state_dict(),
-                    "optimizer": optimizer.state_dict(),
-                    "step": step + 1,
-                    "loss": total_loss / (step + 1),
-                },
-                ckpt_path,
-            )
-            print(f"[Stage1] Checkpoint saved: {ckpt_path}")
 
     # final save
     final_path = checkpoint_dir / "stage1_final.pt"
     torch.save(
         {
-            "thought_block": thought_block.state_dict(),
-            "ema_teacher": ema_teacher.teacher.state_dict(),
-            "step": step + 1 if "step" in dir() else 0,
-            "loss": total_loss / max(step + 1, 1) if "step" in dir() else 0,
+            "thought_block": (thought_block.module if n_gpus > 1 else thought_block).state_dict(),
+            "step": global_step,
+            "loss": total_loss / max(global_step, 1),
         },
         final_path,
     )
@@ -298,12 +380,9 @@ def train_stage1(config_path: str):
 # ── CLI ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Hypnos Stage 1 JEPA Training")
-    parser.add_argument(
-        "--config",
-        type=str,
-        default="configs/hypnos_130m.yaml",
-        help="Path to config YAML",
-    )
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", type=str, default="configs/hypnos_1.4b.yaml")
     args = parser.parse_args()
     train_stage1(args.config)
+
+
